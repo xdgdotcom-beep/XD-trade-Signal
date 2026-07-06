@@ -596,7 +596,9 @@ let swReg = null;
 async function seedHistory(symbol, interval){
   const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=150`;
   const res = await fetch(url);
+  if (!res.ok) throw new Error(`History fetch failed for ${symbol}: HTTP ${res.status}`);
   const rows = await res.json();
+  if (!Array.isArray(rows)) throw new Error(`Unexpected history response for ${symbol}: ${JSON.stringify(rows).slice(0,120)}`);
   buffers[symbol] = {
     close: rows.map(r => parseFloat(r[4])),
     high: rows.map(r => parseFloat(r[2])),
@@ -608,24 +610,52 @@ async function seedHistory(symbol, interval){
 }
 
 async function seed24h(symbol){
-  const res = await fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`);
-  const d = await res.json();
-  dayChange[symbol] = parseFloat(d.priceChangePercent);
+  try{
+    const res = await fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`);
+    const d = await res.json();
+    dayChange[symbol] = parseFloat(d.priceChangePercent);
+  } catch(e){
+    console.warn('24h ticker failed for', symbol, e);
+  }
 }
 
-function connectWS(symbols, interval){
-  const streams = symbols.map(s => `${s.toLowerCase()}@kline_${interval}`).join('/');
-  ws = new WebSocket(`wss://stream.binance.com:9443/stream?streams=${streams}`);
+let wsWatchdog = null;
 
-  ws.onopen = () => { document.getElementById('statusText').textContent = 'live — connected to Binance'; };
+function connectWS(symbols, interval){
+  // Deliberately omitting the explicit :9443 port — it's blocked by a lot of
+  // mobile carrier / Wi-Fi firewalls. This defaults to the standard 443 port,
+  // which passes through far more networks.
+  const streams = symbols.map(s => `${s.toLowerCase()}@kline_${interval}`).join('/');
+  ws = new WebSocket(`wss://stream.binance.com/stream?streams=${streams}`);
+
+  ws.onopen = () => {
+    document.getElementById('statusText').textContent = 'live — connected to Binance';
+    resetWatchdog(symbols, interval);
+  };
   ws.onclose = () => {
     document.getElementById('statusText').textContent = 'disconnected — reconnecting…';
+    clearTimeout(wsWatchdog);
     if (monitoring) setTimeout(() => connectWS(symbols, interval), 2000);
   };
-  ws.onerror = () => { ws.close(); };
+  ws.onerror = (e) => {
+    console.warn('WebSocket error', e);
+    document.getElementById('statusText').textContent = 'connection error — retrying…';
+    ws.close();
+  };
 
   ws.onmessage = (msg) => {
-    const payload = JSON.parse(msg.data);
+    resetWatchdog(symbols, interval);
+    let payload;
+    try{
+      payload = JSON.parse(msg.data);
+    } catch(e){
+      console.warn('Bad WS message', msg.data);
+      return;
+    }
+    if (!payload || !payload.data || !payload.data.k){
+      // Binance sends non-kline control messages sometimes (e.g. subscription acks) — ignore them.
+      return;
+    }
     const k = payload.data.k;
     const symbol = payload.data.s;
     const buf = buffers[symbol];
@@ -658,6 +688,18 @@ function connectWS(symbols, interval){
   };
 }
 
+// If we go 25s with zero messages after connecting, the socket is very likely
+// stuck (some networks open the handshake then silently drop all frames).
+// Force a fresh reconnect rather than sitting dead indefinitely.
+function resetWatchdog(symbols, interval){
+  clearTimeout(wsWatchdog);
+  wsWatchdog = setTimeout(() => {
+    if (!monitoring) return;
+    document.getElementById('statusText').textContent = 'no data received — reconnecting…';
+    if (ws) ws.close();
+  }, 25000);
+}
+
 let monitoring = false;
 
 async function startMonitoring(){
@@ -679,7 +721,14 @@ async function startMonitoring(){
   const symbols = Array.from(selectedAssets);
   for (const s of Object.keys(buffers)) delete buffers[s];
   for (const s of Object.keys(indicatorSnapshot)) delete indicatorSnapshot[s];
-  await Promise.all(symbols.map(s => seedHistory(s, selectedInterval)));
+  try{
+    await Promise.all(symbols.map(s => seedHistory(s, selectedInterval)));
+  } catch(e){
+    console.error('History load failed', e);
+    document.getElementById('statusText').textContent = 'couldn\'t load price history — check your connection and try again';
+    monitoring = false;
+    return;
+  }
   await Promise.all(symbols.map(s => seed24h(s)));
 
   buildTickerRows(symbols);
@@ -694,6 +743,7 @@ async function startMonitoring(){
 function stopMonitoring(){
   monitoring = false;
   if (ws) ws.close();
+  clearTimeout(wsWatchdog);
   if (uiTickHandle) clearInterval(uiTickHandle);
   uiTickHandle = null;
 }
